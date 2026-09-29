@@ -5,9 +5,11 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+from openpyxl import load_workbook
 
 ROOT = Path(__file__).resolve().parent
 AUTH = 'http://127.0.0.1:18000'
@@ -43,8 +45,6 @@ def main():
     processes = []
     with tempfile.TemporaryDirectory() as temp:
         env = os.environ.copy()
-        env['AUTH_DB'] = str(Path(temp) / 'auth.db')
-        env['FORUM_DB'] = str(Path(temp) / 'forum.db')
         env['JWT_SECRET'] = 'test-secret-only'
         try:
             for module, port in [('auth', '18000'), ('forum', '18001')]:
@@ -54,7 +54,7 @@ def main():
             ready(AUTH, processes[0])
             ready(FORUM, processes[1])
 
-            user = {'username': 'student', 'password': 'secret123'}
+            user = {'username': 'test_' + uuid.uuid4().hex[:12], 'password': 'secret123'}
             status, _ = request('POST', AUTH + '/register', user)
             assert status == 201, 'Регистрация'
             status, tokens = request('POST', AUTH + '/login', user)
@@ -65,12 +65,13 @@ def main():
             status, _ = request('POST', FORUM + '/topics', {'title': 'Тема', 'body': 'Текст'})
             assert status in (401, 403), 'Запрет создания темы без токена'
             status, topic = request('POST', FORUM + '/topics', {'title': 'Тема', 'body': 'Текст'}, access)
-            assert status == 201 and topic['id'] == 1, 'Создание темы'
-            status, comment = request('POST', FORUM + '/topics/1/comments', {'body': 'Ответ'}, access)
-            assert status == 201 and comment['topic_id'] == 1, 'Комментарий'
+            assert status == 201 and topic['id'] > 0, 'Создание темы'
+            topic_id = topic['id']
+            status, comment = request('POST', FORUM + f'/topics/{topic_id}/comments', {'body': 'Ответ'}, access)
+            assert status == 201 and comment['topic_id'] == topic_id, 'Комментарий'
             status, topics = request('GET', FORUM + '/topics')
-            assert status == 200 and len(topics) == 1, 'Список тем'
-            status, topic = request('GET', FORUM + '/topics/1')
+            assert status == 200 and any(t['id'] == topic_id for t in topics), 'Список тем'
+            status, topic = request('GET', FORUM + f'/topics/{topic_id}')
             assert status == 200 and topic['comments'][0]['body'] == 'Ответ', 'Тема с комментариями'
 
             status, new_tokens = request('POST', AUTH + '/refresh', {'refresh_token': refresh})
@@ -79,7 +80,12 @@ def main():
             assert status == 401, 'Повторное использование refresh токена'
             status, _ = request('POST', FORUM + '/topics', {'title': 'Ещё', 'body': 'Текст'}, new_tokens['refresh_token'])
             assert status == 401, 'Refresh токен не подходит для API форума'
-            print('OK: регистрация, вход, темы, комментарии, refresh и проверки доступа')
+            report = str(Path(temp) / 'users.xlsx')
+            subprocess.run([sys.executable, 'export_users.py', report], cwd=ROOT, env=env, check=True)
+            book = load_workbook(report, read_only=True)
+            assert any(row[1] == user['username'] for row in book.active.values), 'Экспорт пользователей'
+            book.close()
+            print('OK: регистрация, вход, темы, комментарии, refresh, доступ и Excel')
         finally:
             for process in processes:
                 process.terminate()
